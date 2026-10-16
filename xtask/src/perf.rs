@@ -19,7 +19,8 @@
 //!
 //! Exit status: non-zero when an enforced budget breaks (full mode), a scenario's p50 regresses
 //! more than the threshold against a baseline from the same machine class and mode, or a bench
-//! fails. Runs from different machine classes are never compared.
+//! fails. Runs from different machine classes are never compared. Performance checks are skipped
+//! when the host load average exceeds twice its available core count.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use std::collections::BTreeMap;
@@ -512,6 +513,11 @@ pub fn load_avg() -> Option<[f64; 3]> {
     output("sysctl", &["-n", "vm.loadavg"]).and_then(|s| parse_loadavg(&s))
 }
 
+fn host_overloaded(load_start: Option<[f64; 3]>, load_end: Option<[f64; 3]>, cores: Option<usize>) -> bool {
+    let Some(cores) = cores.filter(|n| *n > 0) else { return false };
+    [load_start, load_end].into_iter().flatten().any(|load| load[0].is_finite() && load[0] > cores as f64 * 2.0)
+}
+
 fn proc_field(file: &str, key: &str) -> Option<String> {
     let s = std::fs::read_to_string(file).ok()?;
     s.lines().find(|l| l.starts_with(key)).and_then(|l| l.split_once(':').or_else(|| l.split_once('='))).map(|(_, v)| v.trim().trim_matches('"').to_string())
@@ -782,7 +788,13 @@ pub fn run(root: &Path, rest: &[&str]) -> Result<(), String> {
         Some(Err(e)) => (None, Some(e)),
         None => (None, Some(format!("no {BASELINE}: regression check skipped"))),
     };
-    let outcomes = evaluate(&budgets, &reports, baseline.as_ref(), threshold, !o.quick);
+    let overloaded = host_overloaded(load_start, load_end, m.get("cores").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok()));
+    let (baseline, baseline_note) = if overloaded {
+        (None, Some("host load exceeded twice its available core count; budget and regression checks skipped".to_string()))
+    } else {
+        (baseline, baseline_note)
+    };
+    let outcomes = evaluate(&budgets, &reports, baseline.as_ref(), threshold, !o.quick && !overloaded);
 
     let scenarios: serde_json::Map<String, Value> = budgets
         .scenario
@@ -836,11 +848,13 @@ pub fn run(root: &Path, rest: &[&str]) -> Result<(), String> {
     println!("\n{summary}");
     println!("wrote {}", out_dir.join("results.json").display());
 
-    if o.update_baseline {
+    if o.update_baseline && !overloaded {
         let nb = updated_baseline(baseline_value.as_ref(), &results);
         let text = serde_json::to_string_pretty(&nb).map_err(|e| format!("encode baseline: {e}"))?;
         write(&root.join(BASELINE), &format!("{text}\n"))?;
         println!("updated {BASELINE} ({mode}, machine class {class})");
+    } else if o.update_baseline {
+        println!("skipped baseline update because host load was too high");
     }
     let all: Vec<&String> = failures.iter().chain(&bench_failures).collect();
     if all.is_empty() { Ok(()) } else { Err(format!("{} perf failure(s):\n  {}", all.len(), all.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n  "))) }
@@ -1031,6 +1045,10 @@ not_measurable = "needs a frame harness"
         let out = evaluate(&b, &reports, Some(&base), 50.0, false);
         assert_eq!(out[0].status, Status::Tracked, "threshold is configurable");
 
+        let overloaded = host_overloaded(Some([11.61, 17.94, 17.09]), Some([18.13, 18.69, 17.68]), Some(3));
+        let out = evaluate(&b, &reports, None, 15.0, !overloaded);
+        assert_eq!(out[0].status, Status::Tracked, "an overloaded host makes the budget inconclusive");
+
         // A row the bench didn't produce fails, with the bench's own error when it has one.
         let mut reports = BTreeMap::new();
         reports.insert("b".to_string(), Ok(json!({"rows": [], "context": {"errors": [{"name": "move row", "error": "boom"}]}})));
@@ -1077,6 +1095,9 @@ not_measurable = "needs a frame harness"
         assert_eq!(parse_loadavg("{ 2.10 1.50 0.75 }"), Some([2.1, 1.5, 0.75]));
         assert_eq!(parse_loadavg("0.52 0.58 0.59 1/467 12345\n"), Some([0.52, 0.58, 0.59]));
         assert_eq!(parse_loadavg("garbage"), None);
+        assert!(host_overloaded(Some([11.61, 17.94, 17.09]), Some([18.13, 18.69, 17.68]), Some(3)));
+        assert!(!host_overloaded(Some([6.0, 6.0, 6.0]), None, Some(3)));
+        assert!(!host_overloaded(Some([11.61, 17.94, 17.09]), None, None));
         assert_eq!(iso_utc(0), "1970-01-01T00:00:00Z");
         assert_eq!(iso_utc(1_791_158_400), "2026-10-05T00:00:00Z");
         assert_eq!(iso_utc(951_782_400), "2000-02-29T00:00:00Z");
